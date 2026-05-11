@@ -46,9 +46,9 @@ object LocationHook {
             resolver.query(uri, null, null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     FakeState(
-                        enabled = cursor.getInt(0) == 1,
-                        lat = cursor.getString(1).toDoubleOrNull() ?: 39.9042,
-                        lon = cursor.getString(2).toDoubleOrNull() ?: 116.4074
+                        enabled = cursor.getInt(cursor.getColumnIndexOrThrow("enabled")) == 1,
+                        lat = cursor.getString(cursor.getColumnIndexOrThrow("gcj_lat")).toDoubleOrNull() ?: 39.9042,
+                        lon = cursor.getString(cursor.getColumnIndexOrThrow("gcj_lon")).toDoubleOrNull() ?: 116.4074
                     )
                 } else FakeState(false, 39.9042, 116.4074)
             } ?: cachedState
@@ -96,13 +96,15 @@ object LocationHook {
     }
 
     // ── Hook 1: Location.getLatitude / getLongitude ──────────────────────────
+    // 注意：不在注册时获取 context，而是在回调触发时懒加载。
+    // 原因：系统进程（android）启动极早期 ActivityThread.currentApplication() 返回 null，
+    // 若在 install() 时就取 context 会导致整个 Hook 被 ?: return 跳过，永远不生效。
 
     private fun hookLocationObject() {
-        val ctx = getAppContext() ?: return
-
         val latHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
+                    val ctx = getAppContext() ?: return
                     val state = getState(ctx.contentResolver)
                     if (!state.enabled) return
                     param.result = state.lat
@@ -112,6 +114,7 @@ object LocationHook {
         val lonHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
+                    val ctx = getAppContext() ?: return
                     val state = getState(ctx.contentResolver)
                     if (!state.enabled) return
                     param.result = state.lon
@@ -126,10 +129,9 @@ object LocationHook {
     }
 
     // ── Hook 2: LocationManager ──────────────────────────────────────────────
+    // 同样不在注册时获取 context，在每个回调内部懒加载，防止系统进程早期 null 导致跳过注册。
 
     private fun hookLocationManager(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val ctx = getAppContext() ?: return
-
         // getLastKnownLocation
         try {
             XposedHelpers.findAndHookMethod(
@@ -138,6 +140,7 @@ object LocationHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            val ctx = getAppContext() ?: return
                             val state = getState(ctx.contentResolver)
                             if (!state.enabled) return
                             val provider = param.args[0] as? String ?: LocationManager.GPS_PROVIDER
@@ -156,6 +159,7 @@ object LocationHook {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
+                            val ctx = getAppContext() ?: return
                             val orig = param.args[3] as? LocationListener ?: return
                             param.args[3] = wrapListener(orig, ctx)
                         } catch (_: Throwable) {}
@@ -173,6 +177,7 @@ object LocationHook {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
+                            val ctx = getAppContext() ?: return
                             val orig = param.args[3] as? LocationListener ?: return
                             param.args[3] = wrapListener(orig, ctx)
                         } catch (_: Throwable) {}
@@ -192,17 +197,15 @@ object LocationHook {
     )
 
     private fun hookLocationManagerService(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val ctx = getAppContext() ?: return
-
         for (className in SERVICE_CLASS_NAMES) {
             try {
                 val clz = XposedHelpers.findClass(className, lpparam.classLoader)
-                // getLastLocation / getLastKnownLocation
                 for (methodName in listOf("getLastLocation", "getLastKnownLocation")) {
                     try {
                         XposedBridge.hookAllMethods(clz, methodName, object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 try {
+                                    val ctx = getAppContext() ?: return
                                     val state = getState(ctx.contentResolver)
                                     if (!state.enabled) return
                                     val result = param.result as? Location ?: return
@@ -227,14 +230,13 @@ object LocationHook {
     )
 
     private fun hookGnssProvider(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val ctx = getAppContext() ?: return
-
         for (className in GNSS_CLASS_NAMES) {
             try {
                 val clz = XposedHelpers.findClass(className, lpparam.classLoader)
                 XposedBridge.hookAllMethods(clz, "reportLocation", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
+                            val ctx = getAppContext() ?: return
                             val state = getState(ctx.contentResolver)
                             if (!state.enabled) return
                             // reportLocation 第一个参数通常是 Location
@@ -258,8 +260,6 @@ object LocationHook {
     )
 
     private fun hookFusedProvider(lpparam: XC_LoadPackage.LoadPackageParam) {
-        val ctx = getAppContext() ?: return
-
         for (className in FUSED_CLASS_NAMES) {
             try {
                 val clz = XposedHelpers.findClass(className, lpparam.classLoader)
@@ -268,6 +268,7 @@ object LocationHook {
                         XposedBridge.hookAllMethods(clz, methodName, object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 try {
+                                    val ctx = getAppContext() ?: return
                                     val state = getState(ctx.contentResolver)
                                     if (!state.enabled) return
                                     val loc = (param.result as? Location)
@@ -292,6 +293,7 @@ object LocationHook {
         ctx: android.content.Context
     ): LocationListener = LocationListener { real ->
         try {
+            // ctx 由调用方在回调触发时传入（已在回调内部懒加载），此处直接用
             val state = getState(ctx.contentResolver)
             if (state.enabled) {
                 original.onLocationChanged(
