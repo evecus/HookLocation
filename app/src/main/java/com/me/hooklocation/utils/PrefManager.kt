@@ -107,24 +107,29 @@ object PrefManager {
     /**
      * 把当前的 enabled / gcj_lat / gcj_lon 写入 /data/local/tmp/hooklocation_state.json。
      * 文件权限设为 0644，系统进程和所有 App 均可读。
-     * 使用 root shell 写文件并 chmod，保证权限正确。
+     *
+     * 修复：原来用 su -c echo '$json' 会因 shell 对花括号/引号的转义导致 JSON 写入损坏。
+     * 改为：先把 JSON 写到 App 私有目录的临时文件（无需权限），再用 su cp 复制过去。
      */
     private fun syncStateFile(context: Context) {
         val prefs   = getPrefs(context)
         val enabled = prefs.getBoolean(KEY_ENABLED, false)
-        val lat     = prefs.getFloat(KEY_GCJ_LAT, 39.9042f)
-        val lon     = prefs.getFloat(KEY_GCJ_LON, 116.4074f)
+        val lat     = prefs.getFloat(KEY_GCJ_LAT, 39.9042f).toDouble()
+        val lon     = prefs.getFloat(KEY_GCJ_LON, 116.4074f).toDouble()
 
         val json = """{"enabled":$enabled,"gcj_lat":$lat,"gcj_lon":$lon}"""
 
         try {
-            // 用 su 写文件并 chmod，确保系统进程可读
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c",
-                "echo '$json' > $STATE_FILE && chmod 644 $STATE_FILE"))
+            // 先写到 App 私有目录（无需 root），再用 su cp 复制到目标路径并 chmod
+            val tmpFile = File(context.cacheDir, "hl_state_tmp.json")
+            tmpFile.writeText(json)
+            val cmd = "cp ${tmpFile.absolutePath} $STATE_FILE && chmod 644 $STATE_FILE"
+            val process = ProcessBuilder("su", "-c", cmd).start()
             process.waitFor()
+            tmpFile.delete()
             Log.d(TAG, "State synced: $json")
         } catch (e: Throwable) {
-            // 没有 root 时降级：直接写文件（可能权限不足，但先试试）
+            // 没有 root 时降级：直接写文件
             try {
                 File(STATE_FILE).writeText(json)
                 File(STATE_FILE).setReadable(true, false)
