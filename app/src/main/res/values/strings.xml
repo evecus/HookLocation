@@ -4,5 +4,15 @@
     <string-array name="xposed_scope">
         <item>android</item>
         <item>com.android.phone</item>
+        <item>com.android.bluetooth</item>
+        <item>com.android.location.fused</item>
+        <item>com.google.android.gms</item>
+        <item>com.oplus.location</item>
+        <item>com.coloros.location</item>
+        <item>com.miui.location</item>
+        <item>com.huawei.location</item>
+        <item>com.vivo.location</item>
+        <item>com.samsung.location</item>
+        <item>com.meizu.location</item>
     </string-array>
 </resources>
