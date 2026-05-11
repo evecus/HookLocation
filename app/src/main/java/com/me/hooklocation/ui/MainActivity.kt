@@ -50,17 +50,6 @@ class MainActivity : AppCompatActivity() {
         refreshSavedList()
     }
 
-    // ── Module active status ─────────────────────────────────────────────────
-
-    private fun setupModuleStatus() {
-        // If this code runs, the module is NOT active (hooks won't be in our own process).
-        // If hooked, this field would be modified — but since we excluded ourselves it stays false.
-        binding.cardModuleStatus.setCardBackgroundColor(
-            getColor(R.color.status_inactive)
-        )
-        binding.tvModuleStatus.text = "模块未激活 — 请在 LSPosed 中启用并重启"
-        binding.ivStatusIcon.setImageResource(R.drawable.ic_warning)
-    }
 
     // ── Input panel ──────────────────────────────────────────────────────────
 
