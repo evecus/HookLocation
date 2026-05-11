@@ -4,9 +4,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Required for XSharedPreferences world-readable mode -->
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -38,13 +35,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- ContentProvider for cross-process state sharing -->
-        <provider
-            android:name=".utils.LocationProvider"
-            android:authorities="com.me.hooklocation.provider"
-            android:exported="true"
-            android:grantUriPermissions="false" />
 
     </application>
 
