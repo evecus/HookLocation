@@ -38,8 +38,8 @@ android {
 
 dependencies {
     // XposedBridge API (compileOnly - provided by LSPosed at runtime)
-    compileOnly 'de.robv.android.xposed:api:82'
-    compileOnly 'de.robv.android.xposed:api:82:sources'
+    // hosted on jitpack from the official rovo89 repo mirror
+    compileOnly 'com.github.rovo89.XposedBridge:api:89'
 
     // AndroidX
     implementation 'androidx.core:core-ktx:1.13.1'
