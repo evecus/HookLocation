@@ -9,56 +9,42 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import org.json.JSONObject
+import java.io.File
 
 /**
  * 系统进程级别定位 Hook。
- * 注入到系统定位服务进程（android / com.oplus.location 等），
- * 所有 App 调用系统定位时均自动返回虚假坐标，无需逐 App 勾选。
  *
- * 状态读取：XSharedPreferences（不受 AppsFilter/PackageVisibility 限制）
- *
- * Hook 点：
- *   1. Location.getLatitude() / getLongitude()          — 最底层兜底
- *   2. LocationManager.getLastKnownLocation()           — 客户端 API
- *   3. LocationManager.requestLocationUpdates()         — 客户端 API
- *   4. LocationManagerService（系统服务内部实现）
- *   5. GnssLocationProvider（GPS 硬件层）
- *   6. FusedLocationProvider（一体化位置）
+ * 状态读取：直接读 /data/local/tmp/hooklocation_state.json（App 侧 root 写入，权限 644）
+ * 完全绕过 ContentProvider AppsFilter 和 XSharedPreferences 路径隔离问题。
  */
 object LocationHook {
 
-    private const val PREF_NAME = "hooklocation_prefs"
-    private const val PKG_NAME  = "com.me.hooklocation"
-    private const val TAG       = "[HookLocation]"
+    private const val STATE_FILE = "/data/local/tmp/hooklocation_state.json"
+    private const val TAG        = "[HookLocation]"
 
-    // ── 状态缓存（XSharedPreferences 每 500ms 最多刷新一次）──────────────
+    // ── 状态缓存（每 500ms 最多重新读一次文件）────────────────────────────
     private const val CACHE_TTL = 500L
-    private var cachedState = FakeState(false, 39.9042, 116.4074)
-    private var lastQueryTime = 0L
+    private var cachedState  = FakeState(false, 39.9042, 116.4074)
+    private var lastReadTime = 0L
 
     private data class FakeState(val enabled: Boolean, val lat: Double, val lon: Double)
 
-    /**
-     * 通过 XSharedPreferences 读取虚拟定位开关和坐标。
-     * XSharedPreferences 在被注入的系统进程里直接读文件，
-     * 完全绕过 AppsFilter / PackageVisibility 限制，不需要 ContentProvider。
-     */
     private fun getState(): FakeState {
         val now = System.currentTimeMillis()
-        if (now - lastQueryTime < CACHE_TTL) return cachedState
-        lastQueryTime = now
+        if (now - lastReadTime < CACHE_TTL) return cachedState
+        lastReadTime = now
 
         return try {
-            @Suppress("DEPRECATION")
-            val prefs = de.robv.android.xposed.XSharedPreferences(PKG_NAME, PREF_NAME)
-            prefs.reload()
+            val text = File(STATE_FILE).readText().trim()
+            val json = JSONObject(text)
             FakeState(
-                enabled = prefs.getBoolean("enabled", false),
-                lat     = prefs.getFloat("gcj_lat", 39.9042f).toDouble(),
-                lon     = prefs.getFloat("gcj_lon", 116.4074f).toDouble()
+                enabled = json.optBoolean("enabled", false),
+                lat     = json.optDouble("gcj_lat", 39.9042),
+                lon     = json.optDouble("gcj_lon", 116.4074)
             )
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG XSharedPreferences read failed: ${e.message}")
+            // 文件不存在或解析失败时保持上次缓存
             cachedState
         }.also { cachedState = it }
     }
@@ -130,7 +116,6 @@ object LocationHook {
     // ── Hook 2 & 3: LocationManager 客户端 API ───────────────────────────────
 
     private fun hookLocationManager() {
-        // getLastKnownLocation
         try {
             XposedHelpers.findAndHookMethod(
                 LocationManager::class.java, "getLastKnownLocation",
