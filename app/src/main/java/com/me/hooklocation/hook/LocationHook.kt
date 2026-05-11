@@ -6,6 +6,7 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.SystemClock
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
@@ -114,6 +115,64 @@ object LocationHook {
         hookLocationManagerService(lpparam)
         hookGnssProvider(lpparam)
         hookFusedProvider(lpparam)
+        hookLocationConstructor()
+    }
+
+    // ── Hook 0: Location 构造函数 + isFromMockProvider ───────────────────────
+    // 借鉴 GlobalTraveling：在对象创建时就注入坐标，最彻底；
+    // 同时让 isFromMockProvider 返回 false，防止 App 检测到虚拟定位。
+
+    private fun hookLocationConstructor() {
+        // Hook Location(String provider) 构造函数
+        try {
+            XposedHelpers.findAndHookConstructor(
+                Location::class.java, String::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val state = getState()
+                            if (!state.enabled) return
+                            val loc = param.thisObject as? Location ?: return
+                            loc.latitude  = state.lat
+                            loc.longitude = state.lon
+                        } catch (_: Throwable) {}
+                    }
+                })
+            XposedBridge.log("$TAG hooked Location(String) constructor")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG Location constructor hook failed: ${e.message}")
+        }
+
+        // Hook Location.set(Location) — 拦截坐标复制
+        try {
+            XposedHelpers.findAndHookMethod(
+                Location::class.java, "set", Location::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val state = getState()
+                            if (!state.enabled) return
+                            val loc = param.thisObject as? Location ?: return
+                            loc.latitude  = state.lat
+                            loc.longitude = state.lon
+                        } catch (_: Throwable) {}
+                    }
+                })
+            XposedBridge.log("$TAG hooked Location.set")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG Location.set hook failed: ${e.message}")
+        }
+
+        // isFromMockProvider → false，防止 App 检测到虚拟定位
+        try {
+            XposedHelpers.findAndHookMethod(
+                Location::class.java, "isFromMockProvider",
+                XC_MethodReplacement.returnConstant(false)
+            )
+            XposedBridge.log("$TAG hooked isFromMockProvider")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG isFromMockProvider hook failed: ${e.message}")
+        }
     }
 
     // ── Hook 1: Location.getLatitude / getLongitude ──────────────────────────
