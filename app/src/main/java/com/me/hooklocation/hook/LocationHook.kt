@@ -1,10 +1,8 @@
 package com.me.hooklocation.hook
 
-import android.content.ContentResolver
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import de.robv.android.xposed.XC_MethodHook
@@ -17,42 +15,50 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
  * 注入到系统定位服务进程（android / com.oplus.location 等），
  * 所有 App 调用系统定位时均自动返回虚假坐标，无需逐 App 勾选。
  *
+ * 状态读取：XSharedPreferences（不受 AppsFilter/PackageVisibility 限制）
+ *
  * Hook 点：
- *   1. LocationManagerService.getLastLocation()         — 系统服务层
- *   2. LocationManagerService.requestLocationUpdates()  — 系统服务层
- *   3. Location.getLatitude() / getLongitude()          — 兜底，覆盖所有 Location 对象
- *   4. GnssLocationProvider (GPS 硬件层)                — AOSP GPS 提供者
- *   5. FusedLocationProvider                            — 一体化位置
+ *   1. Location.getLatitude() / getLongitude()          — 最底层兜底
+ *   2. LocationManager.getLastKnownLocation()           — 客户端 API
+ *   3. LocationManager.requestLocationUpdates()         — 客户端 API
+ *   4. LocationManagerService（系统服务内部实现）
+ *   5. GnssLocationProvider（GPS 硬件层）
+ *   6. FusedLocationProvider（一体化位置）
  */
 object LocationHook {
 
-    private const val AUTHORITY = "com.me.hooklocation.provider"
-    private const val TAG = "[HookLocation]"
+    private const val PREF_NAME = "hooklocation_prefs"
+    private const val PKG_NAME  = "com.me.hooklocation"
+    private const val TAG       = "[HookLocation]"
 
-    // ── 状态缓存（避免每次都跨进程查 ContentProvider）──────────────────────
-    // 每 500ms 最多刷新一次
-    private var cachedState: FakeState = FakeState(false, 39.9042, 116.4074)
-    private var lastQueryTime = 0L
+    // ── 状态缓存（XSharedPreferences 每 500ms 最多刷新一次）──────────────
     private const val CACHE_TTL = 500L
+    private var cachedState = FakeState(false, 39.9042, 116.4074)
+    private var lastQueryTime = 0L
 
     private data class FakeState(val enabled: Boolean, val lat: Double, val lon: Double)
 
-    private fun getState(resolver: ContentResolver): FakeState {
+    /**
+     * 通过 XSharedPreferences 读取虚拟定位开关和坐标。
+     * XSharedPreferences 在被注入的系统进程里直接读文件，
+     * 完全绕过 AppsFilter / PackageVisibility 限制，不需要 ContentProvider。
+     */
+    private fun getState(): FakeState {
         val now = System.currentTimeMillis()
         if (now - lastQueryTime < CACHE_TTL) return cachedState
         lastQueryTime = now
+
         return try {
-            val uri = Uri.parse("content://$AUTHORITY/state")
-            resolver.query(uri, null, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    FakeState(
-                        enabled = cursor.getInt(cursor.getColumnIndexOrThrow("enabled")) == 1,
-                        lat = cursor.getString(cursor.getColumnIndexOrThrow("gcj_lat")).toDoubleOrNull() ?: 39.9042,
-                        lon = cursor.getString(cursor.getColumnIndexOrThrow("gcj_lon")).toDoubleOrNull() ?: 116.4074
-                    )
-                } else FakeState(false, 39.9042, 116.4074)
-            } ?: cachedState
-        } catch (e: Exception) {
+            @Suppress("DEPRECATION")
+            val prefs = de.robv.android.xposed.XSharedPreferences(PKG_NAME, PREF_NAME)
+            prefs.reload()
+            FakeState(
+                enabled = prefs.getBoolean("enabled", false),
+                lat     = prefs.getFloat("gcj_lat", 39.9042f).toDouble(),
+                lon     = prefs.getFloat("gcj_lon", 116.4074f).toDouble()
+            )
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG XSharedPreferences read failed: ${e.message}")
             cachedState
         }.also { cachedState = it }
     }
@@ -61,77 +67,69 @@ object LocationHook {
 
     private fun fakeLocation(provider: String, lat: Double, lon: Double): Location =
         Location(provider).apply {
-            latitude = lat
+            latitude  = lat
             longitude = lon
-            altitude = 8.0
-            accuracy = 3.0f
-            speed = 0.0f
-            bearing = 0.0f
-            time = System.currentTimeMillis()
+            altitude  = 8.0
+            accuracy  = 3.0f
+            speed     = 0.0f
+            bearing   = 0.0f
+            time      = System.currentTimeMillis()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                verticalAccuracyMeters = 3.0f
+                verticalAccuracyMeters       = 3.0f
                 speedAccuracyMetersPerSecond = 0.0f
-                bearingAccuracyDegrees = 0.0f
-                elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+                bearingAccuracyDegrees       = 0.0f
+                elapsedRealtimeNanos         = SystemClock.elapsedRealtimeNanos()
             }
         }
 
     // ── 安装所有 Hook ────────────────────────────────────────────────────────
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // Hook 1: Location 对象的 getLatitude/getLongitude — 最底层兜底
+        XposedBridge.log("$TAG install() in ${lpparam.packageName}")
         hookLocationObject()
-
-        // Hook 2: LocationManager 客户端 API（在系统框架进程里也有）
-        hookLocationManager(lpparam)
-
-        // Hook 3: 系统服务内部实现类（各版本/厂商不同，全部 try-catch）
+        hookLocationManager()
         hookLocationManagerService(lpparam)
-
-        // Hook 4: GnssLocationProvider GPS 硬件层
         hookGnssProvider(lpparam)
-
-        // Hook 5: FusedLocationProvider
         hookFusedProvider(lpparam)
     }
 
     // ── Hook 1: Location.getLatitude / getLongitude ──────────────────────────
-    // 注意：不在注册时获取 context，而是在回调触发时懒加载。
-    // 原因：系统进程（android）启动极早期 ActivityThread.currentApplication() 返回 null，
-    // 若在 install() 时就取 context 会导致整个 Hook 被 ?: return 跳过，永远不生效。
 
     private fun hookLocationObject() {
-        val latHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val ctx = getAppContext() ?: return
-                    val state = getState(ctx.contentResolver)
-                    if (!state.enabled) return
-                    param.result = state.lat
-                } catch (_: Throwable) {}
-            }
+        try {
+            XposedHelpers.findAndHookMethod(Location::class.java, "getLatitude",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val state = getState()
+                            if (state.enabled) param.result = state.lat
+                        } catch (_: Throwable) {}
+                    }
+                })
+            XposedBridge.log("$TAG hooked Location.getLatitude")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG getLatitude hook failed: ${e.message}")
         }
-        val lonHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val ctx = getAppContext() ?: return
-                    val state = getState(ctx.contentResolver)
-                    if (!state.enabled) return
-                    param.result = state.lon
-                } catch (_: Throwable) {}
-            }
-        }
-        try { XposedHelpers.findAndHookMethod(Location::class.java, "getLatitude", latHook) }
-        catch (e: Throwable) { XposedBridge.log("$TAG getLatitude hook failed: ${e.message}") }
 
-        try { XposedHelpers.findAndHookMethod(Location::class.java, "getLongitude", lonHook) }
-        catch (e: Throwable) { XposedBridge.log("$TAG getLongitude hook failed: ${e.message}") }
+        try {
+            XposedHelpers.findAndHookMethod(Location::class.java, "getLongitude",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val state = getState()
+                            if (state.enabled) param.result = state.lon
+                        } catch (_: Throwable) {}
+                    }
+                })
+            XposedBridge.log("$TAG hooked Location.getLongitude")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG getLongitude hook failed: ${e.message}")
+        }
     }
 
-    // ── Hook 2: LocationManager ──────────────────────────────────────────────
-    // 同样不在注册时获取 context，在每个回调内部懒加载，防止系统进程早期 null 导致跳过注册。
+    // ── Hook 2 & 3: LocationManager 客户端 API ───────────────────────────────
 
-    private fun hookLocationManager(lpparam: XC_LoadPackage.LoadPackageParam) {
+    private fun hookLocationManager() {
         // getLastKnownLocation
         try {
             XposedHelpers.findAndHookMethod(
@@ -140,33 +138,33 @@ object LocationHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
-                            val ctx = getAppContext() ?: return
-                            val state = getState(ctx.contentResolver)
+                            val state = getState()
                             if (!state.enabled) return
                             val provider = param.args[0] as? String ?: LocationManager.GPS_PROVIDER
                             param.result = fakeLocation(provider, state.lat, state.lon)
                         } catch (_: Throwable) {}
                     }
-                }
-            )
-        } catch (e: Throwable) { XposedBridge.log("$TAG getLastKnownLocation hook failed: ${e.message}") }
+                })
+            XposedBridge.log("$TAG hooked LocationManager.getLastKnownLocation")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG getLastKnownLocation hook failed: ${e.message}")
+        }
 
         // requestLocationUpdates (String, long, float, LocationListener)
         try {
             XposedHelpers.findAndHookMethod(
                 LocationManager::class.java, "requestLocationUpdates",
-                String::class.java, Long::class.java, Float::class.java, LocationListener::class.java,
+                String::class.java, Long::class.java, Float::class.java,
+                LocationListener::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val ctx = getAppContext() ?: return
                             val orig = param.args[3] as? LocationListener ?: return
-                            param.args[3] = wrapListener(orig, ctx)
+                            param.args[3] = wrapListener(orig)
                         } catch (_: Throwable) {}
                     }
-                }
-            )
-        } catch (e: Throwable) { XposedBridge.log("$TAG requestLocationUpdates hook failed: ${e.message}") }
+                })
+        } catch (_: Throwable) {}
 
         // requestLocationUpdates (String, long, float, LocationListener, Handler)
         try {
@@ -177,23 +175,19 @@ object LocationHook {
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val ctx = getAppContext() ?: return
                             val orig = param.args[3] as? LocationListener ?: return
-                            param.args[3] = wrapListener(orig, ctx)
+                            param.args[3] = wrapListener(orig)
                         } catch (_: Throwable) {}
                     }
-                }
-            )
+                })
         } catch (_: Throwable) {}
     }
 
-    // ── Hook 3: LocationManagerService 内部实现 ──────────────────────────────
-    // 系统进程中的真正实现类，不同 Android 版本类名不同
+    // ── Hook 4: LocationManagerService 内部实现 ──────────────────────────────
 
     private val SERVICE_CLASS_NAMES = listOf(
         "com.android.server.location.LocationManagerService",
         "com.android.server.LocationManagerService",
-        "android.location.LocationManager",
     )
 
     private fun hookLocationManagerService(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -205,23 +199,22 @@ object LocationHook {
                         XposedBridge.hookAllMethods(clz, methodName, object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 try {
-                                    val ctx = getAppContext() ?: return
-                                    val state = getState(ctx.contentResolver)
+                                    val state = getState()
                                     if (!state.enabled) return
                                     val result = param.result as? Location ?: return
-                                    result.latitude = state.lat
+                                    result.latitude  = state.lat
                                     result.longitude = state.lon
                                 } catch (_: Throwable) {}
                             }
                         })
-                        XposedBridge.log("$TAG Hooked $className.$methodName")
+                        XposedBridge.log("$TAG hooked $className.$methodName")
                     } catch (_: Throwable) {}
                 }
             } catch (_: Throwable) {}
         }
     }
 
-    // ── Hook 4: GnssLocationProvider (GPS 硬件层) ────────────────────────────
+    // ── Hook 5: GnssLocationProvider (GPS 硬件层) ────────────────────────────
 
     private val GNSS_CLASS_NAMES = listOf(
         "com.android.server.location.gnss.GnssLocationProvider",
@@ -236,22 +229,20 @@ object LocationHook {
                 XposedBridge.hookAllMethods(clz, "reportLocation", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val ctx = getAppContext() ?: return
-                            val state = getState(ctx.contentResolver)
+                            val state = getState()
                             if (!state.enabled) return
-                            // reportLocation 第一个参数通常是 Location
                             val loc = param.args.firstOrNull { it is Location } as? Location ?: return
-                            loc.latitude = state.lat
+                            loc.latitude  = state.lat
                             loc.longitude = state.lon
                         } catch (_: Throwable) {}
                     }
                 })
-                XposedBridge.log("$TAG Hooked $className.reportLocation")
+                XposedBridge.log("$TAG hooked $className.reportLocation")
             } catch (_: Throwable) {}
         }
     }
 
-    // ── Hook 5: FusedLocationProvider ───────────────────────────────────────
+    // ── Hook 6: FusedLocationProvider ───────────────────────────────────────
 
     private val FUSED_CLASS_NAMES = listOf(
         "com.android.server.location.fused.FusedLocationProvider",
@@ -268,58 +259,38 @@ object LocationHook {
                         XposedBridge.hookAllMethods(clz, methodName, object : XC_MethodHook() {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 try {
-                                    val ctx = getAppContext() ?: return
-                                    val state = getState(ctx.contentResolver)
+                                    val state = getState()
                                     if (!state.enabled) return
                                     val loc = (param.result as? Location)
                                         ?: (param.args.firstOrNull { it is Location } as? Location)
                                         ?: return
-                                    loc.latitude = state.lat
+                                    loc.latitude  = state.lat
                                     loc.longitude = state.lon
                                 } catch (_: Throwable) {}
                             }
                         })
                     } catch (_: Throwable) {}
                 }
-                XposedBridge.log("$TAG Hooked FusedProvider: $className")
+                XposedBridge.log("$TAG hooked FusedProvider: $className")
             } catch (_: Throwable) {}
         }
     }
 
     // ── 包装 LocationListener 回调 ───────────────────────────────────────────
 
-    private fun wrapListener(
-        original: LocationListener,
-        ctx: android.content.Context
-    ): LocationListener = LocationListener { real ->
-        try {
-            // ctx 由调用方在回调触发时传入（已在回调内部懒加载），此处直接用
-            val state = getState(ctx.contentResolver)
-            if (state.enabled) {
-                original.onLocationChanged(
-                    fakeLocation(real.provider ?: LocationManager.GPS_PROVIDER, state.lat, state.lon)
-                )
-            } else {
+    private fun wrapListener(original: LocationListener): LocationListener =
+        LocationListener { real ->
+            try {
+                val state = getState()
+                if (state.enabled) {
+                    original.onLocationChanged(
+                        fakeLocation(real.provider ?: LocationManager.GPS_PROVIDER, state.lat, state.lon)
+                    )
+                } else {
+                    original.onLocationChanged(real)
+                }
+            } catch (_: Throwable) {
                 original.onLocationChanged(real)
             }
-        } catch (_: Throwable) {
-            original.onLocationChanged(real)
         }
-    }
-
-    // ── 获取当前进程 Context ─────────────────────────────────────────────────
-
-    private var contextCache: android.content.Context? = null
-
-    private fun getAppContext(): android.content.Context? {
-        contextCache?.let { return it }
-        return try {
-            val ctx = XposedHelpers.callStaticMethod(
-                XposedHelpers.findClass("android.app.ActivityThread", null),
-                "currentApplication"
-            ) as? android.content.Context
-            contextCache = ctx
-            ctx
-        } catch (_: Throwable) { null }
-    }
 }
