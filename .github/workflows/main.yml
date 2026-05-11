@@ -1,9 +1,7 @@
 name: Build APK
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,6 +17,17 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Install Gradle 8.4
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -26,9 +35,6 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
           key: gradle-${{ hashFiles('**/*.gradle*') }}
-
-      - name: Make gradlew executable
-        run: chmod +x gradlew
 
       - name: Build Debug APK
         run: ./gradlew assembleDebug
